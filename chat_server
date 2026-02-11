@@ -1,0 +1,177 @@
+//SERVER
+#include <stdlib.h>
+#include <stdio.h>
+#include <sys/socket.h> //for calling socket function
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <string.h>
+#include <malloc.h>
+#include <stdbool.h>
+#include <unistd.h>
+#include <pthread.h>
+
+struct AcceptedSocket{                  //Info about connected client
+        int acceptedSocketFD;           //file descriptor
+        struct sockaddr_in address;     //socket address
+        int error;                      //since result might be an error
+        bool acceptedSuccessfully;
+
+};
+
+//Global variables
+struct AcceptedSocket acceptedSockets[10];
+int acceptedSocketsCount = 0;
+pthread_mutex_t socketArrayMutex = PTHREAD_MUTEX_INITIALIZER;
+
+FILE *chatHistory_ptr = NULL;   //file pointer for chat history
+pthread_mutex_t fileMutex = PTHREAD_MUTEX_INITIALIZER;  // Mutex for file access
+
+void sendReceivedMessageToOtherClients(char *buffer, int socketFD);
+
+//Purpose: construct code to some server
+struct sockaddr_in* createIPv4Address(char *ip, int port){
+        struct sockaddr_in *address = malloc(sizeof(struct sockaddr_in));     //allocate 16 bytes and return pointer inside it
+                                        //SETTING PROPERTIES OF ADDRESS
+        address->sin_family = AF_INET;           //address family --> IPV4
+        address->sin_port = htons(port);           //assigning port number  //htons --> puts bytes in correct order
+
+        if(strlen(ip) ==0)
+                address->sin_addr.s_addr= INADDR_ANY;           //listen for any incoming address, constant used only on server side
+
+        else
+                inet_pton(AF_INET, ip, &address->sin_addr.s_addr); //convert presenation form of ip address to unsigned integer
+        return address;
+
+};//end struct
+
+int createTCPIpv4Socket(){
+         //3 parameters: domain --> address family (IPV4), type of socket (TCP), protocol (want IP layer)
+        return socket(AF_INET, SOCK_STREAM, 0);
+}
+
+struct AcceptedSocket *acceptIncomingConnection(int serverSocketFD){    //Accepts new client connection
+        struct sockaddr_in clientAddress;
+        int clientAddressSize = sizeof(struct sockaddr_in);
+        int clientSocketFD = accept(serverSocketFD, (struct sockaddr *)&clientAddress, &clientAddressSize);     //-number --> error
+
+        struct AcceptedSocket* acceptedSocket = malloc(sizeof(struct AcceptedSocket));
+        acceptedSocket->address = clientAddress;
+        acceptedSocket->acceptedSocketFD = clientSocketFD;
+        acceptedSocket->acceptedSuccessfully = clientSocketFD>0;
+
+        if(!acceptedSocket->acceptedSuccessfully){
+                acceptedSocket->error = clientSocketFD;
+        }
+        return acceptedSocket;
+}
+
+void* receiveAndPrintIncomingData(void* arg){   //THREAD FUNCTION
+        int socketFD = *((int*)arg);            //Gets the scoketFD, the unique number that identifies one client connection
+        free(arg);                              //Frees argument memory
+
+        char buffer[1024];
+        while(true){                                                            //Continously receives messages
+                ssize_t amountReceived = recv(socketFD, buffer, 1024, 0);       //Recieves the message from the client
+
+                if(amountReceived >0){
+                        buffer[amountReceived] = 0;
+                        printf("%s\n", buffer);                                 //Prints messages
+
+                        //Lock mutex, Prevents multiple threads from writing at the same time
+                        pthread_mutex_lock(&fileMutex);
+
+                        //Append to file
+                        fprintf(chatHistory_ptr, "%s\n", buffer);
+
+                        //Append immediately
+                        fflush(chatHistory_ptr);
+
+                        //Unlock mutex
+                        pthread_mutex_unlock(&fileMutex);
+
+                        sendReceivedMessageToOtherClients(buffer, socketFD);
+                }
+                if (amountReceived ==0){
+                        break;
+                }
+
+        }//end while
+        close(socketFD);  //closing socket file descriptor
+        return NULL;
+}
+
+void sendReceivedMessageToOtherClients(char *buffer, int socketFD){
+        pthread_mutex_lock(&socketArrayMutex);  //protection for shared array
+
+        for(int i = 0; i<acceptedSocketsCount; i++){
+                if (acceptedSockets[i].acceptedSocketFD != socketFD){
+                        send(acceptedSockets[i].acceptedSocketFD, buffer, strlen(buffer), 0);
+                }
+        }
+        pthread_mutex_unlock(&socketArrayMutex);
+}
+
+void receiveAndPrintIncomingDataOnSeparateThread(struct AcceptedSocket *pSocket){
+        pthread_t id;
+
+        //Allocates memory on heap for socketFD
+        int* socketFD_ptr = malloc(sizeof(int));
+        *socketFD_ptr = pSocket->acceptedSocketFD;
+
+        //Spawns thread
+        pthread_create(&id, NULL, receiveAndPrintIncomingData, socketFD_ptr);
+}
+
+void startAcceptingIncomingConnections(int serverSocketFD){     //SPAWNING THREADS
+       while(true){    //loop to accept as many connections
+                struct AcceptedSocket* clientSocket = acceptIncomingConnection(serverSocketFD); //Recieves serverSocketFD
+
+                //Adds client to array
+                pthread_mutex_lock(&socketArrayMutex); //MUTEX: Prevents multiple threads from modifying array at same time; preventing data corruption
+                acceptedSockets[acceptedSocketsCount++] = *clientSocket;
+                pthread_mutex_unlock(&socketArrayMutex);
+
+                //Spawns thread for client
+                receiveAndPrintIncomingDataOnSeparateThread(clientSocket);      //Pass client onto separate thread
+
+        }
+
+}
+
+
+/////
+int main(int arg1, char* arg2[]){
+
+        //Find the port
+        int port = atoi(arg2[1]);
+
+        //Create socket
+        int serverSocketFD= createTCPIpv4Socket();
+
+
+        //Open file and append
+        chatHistory_ptr = fopen("chat_history", "a");
+        if(chatHistory_ptr == NULL){
+                printf("Error: Could not open file. \n");
+        }
+
+        //Creating server address structure, specifying IP and port
+        struct sockaddr_in *serverAddress = createIPv4Address("127.0.0.1", port);
+
+        //Bind server to address
+        int result = bind(serverSocketFD, (struct sockaddr *)serverAddress, sizeof(*serverAddress));
+        if (result == 0){
+                printf("socket was bound successfully\n");
+        }
+
+        //Listens for incoming connections
+        int listenResult = listen(serverSocketFD, 10);  //can queue up to 10 connections
+
+        //Accepts incoming connections in a separate thread, not main thread
+        startAcceptingIncomingConnections(serverSocketFD);
+
+        //shutdown(serverSocketFD, SHUT_RDWR);    //shutting down the server file descriptor
+
+        pthread_exit(NULL);
+        return 0;
+}
